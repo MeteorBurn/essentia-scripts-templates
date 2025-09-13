@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/-bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -38,10 +38,10 @@ CONFIG = {
     "loglevel": "INFO",  # Levels: DEBUG, INFO, WARNING, ERROR
 
     # --- Input/Output ---
-    "input_directory": "music",
-    "output_directory": "results",
+    "input_directory": "/mnt/m/Abstracted",
+    "output_directory": "abstracted_results",
     "file_pattern": "",
-    "max_files": 50,
+    "max_files": 0,
 
     # --- Conversion Parameters ---
     "convert_to_wav": False,
@@ -146,6 +146,18 @@ CONFIG = {
             "output_node": "model/Softmax",
             "gender_threshold": 0.5
         }
+    },
+
+    # --- MAEST Models (end-to-end) ---
+    "maest_models": {
+        "maest_400_v2": {
+            "enabled": True,
+            "config_filename": "discogs-maest-30s-pw-2.json",
+            "model_filename": "discogs-maest-30s-pw-2.pb",
+            "input_node": "melspectrogram",
+            "output_node": "PartitionedCall/Identity_13",
+            "num_genres": 3
+        }
     }
 }
 
@@ -184,9 +196,7 @@ def find_audio_files(directory: str, file_pattern: str = "") -> List[Path]:
                 continue
             audio_files.append(item)
     
-    # Sort files alphabetically to ensure consistent processing order
     audio_files.sort()
-    
     logging.info(f"Found {len(audio_files)} total audio files.")
     return audio_files
 
@@ -249,20 +259,15 @@ def convert_audio_to_wav(input_path: Path, target_sr: int, ffmpeg_exec: str, tem
         return None
 
 def get_platform_paths(file_path: Path) -> Dict[str, str]:
-    """
-    Converts a file path to Windows and WSL formats if applicable.
-    NOTE: This assumes a WSL environment where Windows drives are mounted under /mnt/
-    """
+    """Converts a file path to Windows and WSL formats if applicable."""
     wsl_path = file_path.as_posix()
     win_path = wsl_path
-
     parts = file_path.parts
     if len(parts) > 2 and parts[0] == '/' and parts[1] == 'mnt':
         drive_letter = parts[2]
         if len(drive_letter) == 1 and 'a' <= drive_letter.lower() <= 'z':
-            path_body = "/".join(parts[3:])  # <--- один прямой слеш
+            path_body = "/".join(parts[3:])
             win_path = f"{drive_letter.upper()}:/{path_body}"
-
     return {"win": win_path, "wsl": wsl_path}
 
 # =============================================================================
@@ -271,55 +276,50 @@ def get_platform_paths(file_path: Path) -> Dict[str, str]:
 
 def load_models(config: Dict) -> Optional[Dict[str, Any]]:
     """
-    Loads the base embedding model and the specified classifier models.
+    Loads the base embedding model, classifier models, and MAEST models.
     """
-    models: Dict[str, Any] = {'classifiers': {}}
+    models: Dict[str, Any] = {'classifiers': {}, 'maest': {}}
 
-    # 1. Load base embedding model
-    logging.info("Loading base embedding model (EffNet)...")
-    embedding_model_path = MODELS_BASE_PATH / config["embedding_model_filename"]
-    if not embedding_model_path.is_file():
-        logging.critical(f"Embedding model not found: {embedding_model_path}")
-        return None
-    try:
-        models['embedding_model'] = es.TensorflowPredictEffnetDiscogs(
-            graphFilename=str(embedding_model_path),
-            output="PartitionedCall:1",
-            patchHopSize=config["effnet_patch_hop_size"]
-        )
-        logging.info("Embedding model loaded successfully.")
-    except Exception as e:
-        logging.critical(f"Failed to load embedding model: {e}")
-        return None
+    # 1. Load base embedding model for classifiers
+    if config.get("embedding_model_filename"):
+        logging.info("Loading base embedding model (EffNet)...")
+        embedding_model_path = MODELS_BASE_PATH / config["embedding_model_filename"]
+        if not embedding_model_path.is_file():
+            logging.critical(f"Embedding model not found: {embedding_model_path}")
+            return None
+        try:
+            models['embedding_model'] = es.TensorflowPredictEffnetDiscogs(
+                graphFilename=str(embedding_model_path),
+                output="PartitionedCall:1",
+                patchHopSize=config["effnet_patch_hop_size"]
+            )
+            logging.info("Embedding model loaded successfully.")
+        except Exception as e:
+            logging.critical(f"Failed to load embedding model: {e}")
+            return None
 
     # 2. Load specified classifier models from config
     logging.info("Loading specified classifier models...")
     for model_name, model_params in config.get("classifier_models", {}).items():
         if not model_params.get("enabled", False):
             continue
-
         model_path = MODELS_BASE_PATH / model_params["model_filename"]
         if not model_path.is_file():
             logging.warning(f"Model file for '{model_name}' not found at {model_path}. Skipping.")
             continue
-
         json_path = MODELS_BASE_PATH / model_params["config_filename"]
         model_config = load_json_config(json_path)
         if not model_config:
             logging.warning(f"Config for '{model_name}' not found or failed to load. Skipping.")
             continue
-            
         try:
-            # Build arguments for TensorflowPredict2D dynamically
             model_args = {"graphFilename": str(model_path)}
             if model_params.get("input_node"):
                 model_args["input"] = model_params["input_node"]
             if model_params.get("output_node"):
                 model_args["output"] = model_params["output_node"]
-
             classifier_model = es.TensorflowPredict2D(**model_args)
             labels = process_labels(model_config.get('classes', []))
-
             models['classifiers'][model_name] = {
                 'model': classifier_model,
                 'labels': labels,
@@ -329,8 +329,38 @@ def load_models(config: Dict) -> Optional[Dict[str, Any]]:
             logging.error(f"Failed to load classifier '{model_name}': {e}")
             logging.debug(traceback.format_exc())
 
-    if not models['classifiers']:
-        logging.warning("No active classifier models were loaded. The script will only extract basic file info.")
+    # 3. Load MAEST models
+    logging.info("Loading MAEST models...")
+    for model_name, model_params in config.get("maest_models", {}).items():
+        if not model_params.get("enabled", False):
+            continue
+        model_path = MODELS_BASE_PATH / model_params["model_filename"]
+        if not model_path.is_file():
+            logging.warning(f"Model file for '{model_name}' not found at {model_path}. Skipping.")
+            continue
+        json_path = MODELS_BASE_PATH / model_params["config_filename"]
+        model_config = load_json_config(json_path)
+        if not model_config:
+            logging.warning(f"Config for '{model_name}' not found or failed to load. Skipping.")
+            continue
+        try:
+            maest_model = es.TensorflowPredictMAEST(
+                graphFilename=str(model_path),
+                input=model_params["input_node"],
+                output=model_params["output_node"]
+            )
+            labels = process_labels(model_config.get('classes', []))
+            models['maest'][model_name] = {
+                'model': maest_model,
+                'labels': labels,
+            }
+            logging.info(f" -> Loaded MAEST model: '{model_name}' with {len(labels)} labels.")
+        except Exception as e:
+            logging.error(f"Failed to load MAEST model '{model_name}': {e}")
+            logging.debug(traceback.format_exc())
+
+    if not models['classifiers'] and not models['maest']:
+        logging.warning("No active models were loaded. The script will only extract basic file info.")
 
     return models
 
@@ -352,7 +382,6 @@ def process_predictions(
         return []
 
     probabilities = sorted(zip(labels, predictions_final), key=lambda item: item[1], reverse=True)
-
     return [(label, float(prob)) for label, prob in probabilities[:top_n]]
 
 # =============================================================================
@@ -365,7 +394,7 @@ def analyze_audio_file(
     output_dir: Path
 ) -> Optional[ClassificationResult]:
     """
-    Analyzes a single audio file: extracts embeddings, runs classifiers, and saves results.
+    Analyzes a single audio file with both EffNet classifiers and MAEST models.
     """
     path_to_analyze = original_audio_path
     temp_wav_file: Optional[Path] = None
@@ -378,7 +407,7 @@ def analyze_audio_file(
         if temp_wav_file:
             path_to_analyze, needs_cleanup = temp_wav_file, True
         else:
-            return None  # Conversion error
+            return None
 
     json_data: ClassificationResult = {
         "file_path": get_platform_paths(original_audio_path),
@@ -393,7 +422,6 @@ def analyze_audio_file(
     }
 
     try:
-        # --- Load and process audio ---
         loader = es.MonoLoader(filename=str(path_to_analyze), sampleRate=config["sample_rate"], resampleQuality=config["resample_quality"])
         audio = loader()
         if audio is None or len(audio) < config["sample_rate"] * 0.1:
@@ -403,65 +431,88 @@ def analyze_audio_file(
         if audio is None or len(audio) < config["sample_rate"] * 0.1:
             raise ValueError("Audio segment is too short after trimming.")
 
-        # --- Step 1: Extract full embeddings sequence ---
-        logging.debug(f"Calculating EffNet embeddings for {original_audio_path.name}...")
-        full_embeddings = models['embedding_model'](audio)
-        if full_embeddings is None:
-            raise ValueError("Embedding model returned None.")
-
-        # --- Step 2: Apply all classifiers ---
         all_results = {}
-        for name, classifier_data in models['classifiers'].items():
-            try:
-                model_params = config.get("classifier_models", {}).get(name, {})
-                preds = classifier_data['model'](full_embeddings)
 
-                # --- Check if this is a binary threshold-based model ---
-                threshold_key = next((key for key in model_params if key.endswith('_threshold')), None)
-
-                if threshold_key:
-                    labels = classifier_data['labels']
-                    positive_class = [l for l in labels if not l.startswith('not_') and not l.startswith('non_')][0]
-                    positive_idx = labels.index(positive_class)
-                    
-                    probability = np.mean(preds, axis=0)[positive_idx]
-                    threshold = model_params.get(threshold_key, 0.5)
-                    
-                    result_label = positive_class if probability >= threshold else f"not_{positive_class}"
-                    
-                    all_results[name] = {
-                        "result": result_label,
-                        "confidence": round(float(probability), 4)
-                    }
-                # --- Default handling for top-N tag-based models ---
-                else:
-                    top_n_key = next((key for key in model_params if key.startswith('num_')), None)
-                    top_n = model_params.get(top_n_key, 3)
-
-                    structured_result = process_predictions(
-                        preds, classifier_data['labels'], top_n
-                    )
+        # --- Step 1: MAEST-based models (now first) ---
+        if models.get('maest'):
+            for name, maest_data in models['maest'].items():
+                try:
+                    model_params = config.get("maest_models", {}).get(name, {})
+                    preds = maest_data['model'](audio) # MAEST uses audio directly
+                    top_n = model_params.get("num_genres", 5)
+                    structured_result = process_predictions(preds, maest_data['labels'], top_n)
                     all_results[name] = {
                         "labels": [label for label, score in structured_result],
                         "confidences": [round(score, 4) for label, score in structured_result]
                     }
-            except Exception as classifier_err:
-                logging.error(f"Error in classifier '{name}' for file {original_audio_path.name}: {classifier_err}")
-                all_results[name] = {"error": str(classifier_err)}
+                except Exception as maest_err:
+                    logging.error(f"Error in MAEST model '{name}': {maest_err}")
+                    all_results[name] = {"error": str(maest_err)}
+
+        # --- Step 2: EffNet-based classifiers (now second) ---
+        if models.get('embedding_model') and models.get('classifiers'):
+            logging.debug(f"Calculating EffNet embeddings for {original_audio_path.name}...")
+            full_embeddings = models['embedding_model'](audio)
+            if full_embeddings is None:
+                raise ValueError("Embedding model returned None.")
+
+            # --- Step 2a: Process EffNet Genre classifier first ---
+            genre_model_name = "genre_discogs400"
+            if genre_model_name in models['classifiers']:
+                try:
+                    classifier_data = models['classifiers'][genre_model_name]
+                    model_params = config.get("classifier_models", {}).get(genre_model_name, {})
+                    preds = classifier_data['model'](full_embeddings)
+                    top_n_key = next((key for key in model_params if key.startswith('num_')), None)
+                    top_n = model_params.get(top_n_key, 3)
+                    structured_result = process_predictions(preds, classifier_data['labels'], top_n)
+                    all_results[genre_model_name] = {
+                        "labels": [label for label, score in structured_result],
+                        "confidences": [round(score, 4) for label, score in structured_result]
+                    }
+                except Exception as classifier_err:
+                    logging.error(f"Error in classifier '{genre_model_name}': {classifier_err}")
+                    all_results[genre_model_name] = {"error": str(classifier_err)}
+            
+            # --- Step 2b: Process other classifiers ---
+            for name, classifier_data in models['classifiers'].items():
+                if name == genre_model_name:
+                    continue # Already processed
+                try:
+                    model_params = config.get("classifier_models", {}).get(name, {})
+                    preds = classifier_data['model'](full_embeddings)
+                    threshold_key = next((key for key in model_params if key.endswith('_threshold')), None)
+                    if threshold_key:
+                        labels = classifier_data['labels']
+                        positive_class = [l for l in labels if not l.startswith('not_') and not l.startswith('non_')][0]
+                        positive_idx = labels.index(positive_class)
+                        probability = np.mean(preds, axis=0)[positive_idx]
+                        threshold = model_params.get(threshold_key, 0.5)
+                        result_label = positive_class if probability >= threshold else f"not_{positive_class}"
+                        all_results[name] = {
+                            "result": result_label,
+                            "confidence": round(float(probability), 4)
+                        }
+                    else:
+                        top_n_key = next((key for key in model_params if key.startswith('num_')), None)
+                        top_n = model_params.get(top_n_key, 3)
+                        structured_result = process_predictions(preds, classifier_data['labels'], top_n)
+                        all_results[name] = {
+                            "labels": [label for label, score in structured_result],
+                            "confidences": [round(score, 4) for label, score in structured_result]
+                        }
+                except Exception as classifier_err:
+                    logging.error(f"Error in classifier '{name}': {classifier_err}")
+                    all_results[name] = {"error": str(classifier_err)}
 
         json_data["analysis_results"] = all_results
 
     except Exception as e:
         logging.error(f"Failed to analyze {original_audio_path.name}: {e}")
         logging.debug(traceback.format_exc())
-        if "analysis_results" in json_data:
-            json_data["analysis_results"]["error"] = str(e)
-        else: # If error happened before json_data was initialized
-            json_data["error"] = str(e)
-
+        json_data["error"] = str(e)
 
     finally:
-        # --- Save JSON result ---
         try:
             output_dir.mkdir(parents=True, exist_ok=True)
             json_filename = output_dir / (original_audio_path.stem + ".json")
@@ -470,7 +521,6 @@ def analyze_audio_file(
         except Exception as json_err:
             logging.error(f"Could not save JSON for {original_audio_path.name}: {json_err}")
 
-        # --- Cleanup temporary files ---
         if needs_cleanup and temp_wav_file and temp_wav_file.exists():
             temp_wav_file.unlink(missing_ok=True)
 
@@ -494,21 +544,21 @@ def format_log_summary(results: Dict) -> str:
     """Creates a simple log summary string from the analysis results."""
     summary_parts = []
     
-    # Order matters for the log output
     model_log_order = [
-        "genre_discogs400", "mtg_jamendo_moodtheme", "mtg_jamendo_instrument", "mtt_discogs_effnet", 
+        "genre_discogs400", "maest_400_v2", "mtg_jamendo_moodtheme", "mtg_jamendo_instrument", "mtt_discogs_effnet", 
         "danceability_discogs_effnet", "mood_happy_discogs_effnet",
         "mood_sad_discogs_effnet", "mood_aggressive_discogs_effnet", "mood_relaxed_discogs_effnet",
         "mood_party_discogs_effnet", "voice_instrumental_discogs_effnet", "gender_discogs_effnet"
     ]
 
     log_labels = {
-        "genre_discogs400": "Genre", "mtg_jamendo_instrument": "Instrument",
-        "mtt_discogs_effnet": "Tag", "mtg_jamendo_moodtheme": "Mood",
-        "danceability_discogs_effnet": "Danceable", "mood_happy_discogs_effnet": "Happy",
-        "mood_sad_discogs_effnet": "Sad", "mood_aggressive_discogs_effnet": "Aggressive",
-        "mood_relaxed_discogs_effnet": "Relaxed", "mood_party_discogs_effnet": "Party",
-        "voice_instrumental_discogs_effnet": "Vocal", "gender_discogs_effnet": "Gender"
+        "genre_discogs400": "Genre(EffNet)", "maest_400_v2": "Genre(MAEST)",
+        "mtg_jamendo_instrument": "Instrument", "mtt_discogs_effnet": "Tag", 
+        "mtg_jamendo_moodtheme": "Mood", "danceability_discogs_effnet": "Danceable", 
+        "mood_happy_discogs_effnet": "Happy", "mood_sad_discogs_effnet": "Sad", 
+        "mood_aggressive_discogs_effnet": "Aggressive", "mood_relaxed_discogs_effnet": "Relaxed", 
+        "mood_party_discogs_effnet": "Party", "voice_instrumental_discogs_effnet": "Vocal", 
+        "gender_discogs_effnet": "Gender"
     }
 
     for model_name in model_log_order:
@@ -516,18 +566,14 @@ def format_log_summary(results: Dict) -> str:
         if not result: continue
 
         if "labels" in result and result["labels"]:
-            summary_parts.append(f"{log_labels[model_name]}: {result['labels'][0].capitalize()}")
+            summary_parts.append(f"{log_labels.get(model_name, model_name)}: {result['labels'][0].capitalize()}")
         elif "result" in result:
-            # For binary classifiers
             positive_class = result['result']
             is_positive = not positive_class.startswith('not_') and not positive_class.startswith('non_')
-            
-            # Special case for gender and voice/instrumental for better readability
             if model_name in ["gender_discogs_effnet", "voice_instrumental_discogs_effnet"]:
-                 summary_parts.append(f"{log_labels[model_name]}: {positive_class.capitalize()}")
+                 summary_parts.append(f"{log_labels.get(model_name, model_name)}: {positive_class.capitalize()}")
             else:
-                 summary_parts.append(f"{log_labels[model_name]}: {'Yes' if is_positive else 'No'}")
-
+                 summary_parts.append(f"{log_labels.get(model_name, model_name)}: {'Yes' if is_positive else 'No'}")
 
     if not summary_parts:
         return "No conclusive tags found"
@@ -547,7 +593,6 @@ def run_analysis(config: Dict):
         logging.critical("Model loading failed. Exiting.")
         return
 
-    # Find all audio files, sorted consistently
     all_audio_files = find_audio_files(config["input_directory"], config["file_pattern"])
     if not all_audio_files:
         return
@@ -559,7 +604,6 @@ def run_analysis(config: Dict):
         logging.info("All audio files already have corresponding JSON results. Nothing to do.")
         return
 
-    # Apply max_files as a batch size limit for this run
     max_files_to_process = config.get("max_files", 0)
     if max_files_to_process > 0:
         files_to_process = unprocessed_files[:max_files_to_process]
@@ -576,7 +620,7 @@ def run_analysis(config: Dict):
         result = analyze_audio_file(audio_path, models, config, output_dir)
         file_duration = (datetime.now() - file_start_time).total_seconds()
 
-        if result and not result.get("analysis_results", {}).get("error"):
+        if result and not result.get("error"):
             processed_count += 1
             summary = format_log_summary(result.get("analysis_results", {}))
             logging.info(f"[{i+1}/{total_files}] {audio_path.name} – ({summary}) (time: {file_duration:.2f}s)")
